@@ -6,10 +6,34 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
-from torch.distributed.nn.functional import all_reduce as autograd_all_reduce
 
 from .config import ParallelConfig
 from .fp8 import linear
+
+
+class _ForwardAllReduce(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx: object, tensor: torch.Tensor, group: dist.ProcessGroup) -> torch.Tensor:
+        output = tensor.clone()
+        dist.all_reduce(output, group=group)
+        return output
+
+    @staticmethod
+    def backward(ctx: object, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
+        return grad_output, None
+
+
+class _BackwardAllReduce(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx: object, tensor: torch.Tensor, group: dist.ProcessGroup) -> torch.Tensor:
+        ctx.group = group
+        return tensor
+
+    @staticmethod
+    def backward(ctx: object, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
+        gradient = grad_output.contiguous().clone()
+        dist.all_reduce(gradient, group=ctx.group)
+        return gradient, None
 
 
 def group_size(group: dist.ProcessGroup | None) -> int:
@@ -24,6 +48,7 @@ def group_rank(group: dist.ProcessGroup | None) -> int:
 class ParallelContext:
     config: ParallelConfig
     mesh: DeviceMesh | None = None
+    checkpoint_group: dist.ProcessGroup | None = None
 
     @classmethod
     def initialize(
@@ -41,7 +66,17 @@ class ParallelContext:
             (config.dp_size, config.tp_size, config.cp_size),
             mesh_dim_names=("dp", "tp", "cp"),
         )
-        return cls(config, mesh)
+        checkpoint_groups = []
+        for tp_rank in range(config.tp_size):
+            ranks = [
+                dp_rank * config.tp_size * config.cp_size
+                + tp_rank * config.cp_size
+                + cp_rank
+                for dp_rank in range(config.dp_size)
+                for cp_rank in range(config.cp_size)
+            ]
+            checkpoint_groups.append(dist.new_group(ranks))
+        return cls(config, mesh, checkpoint_groups[group_rank(mesh.get_group("tp"))])
 
     @classmethod
     def single(cls) -> ParallelContext:
@@ -95,6 +130,8 @@ class ColumnParallelLinear(nn.Module):
         self.weight = nn.Parameter(torch.empty(self.local_out_features, in_features))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.group is not None:
+            x = _BackwardAllReduce.apply(x, self.group)
         return linear(x, self.weight, self.fp8)
 
 
@@ -122,7 +159,7 @@ class RowParallelLinear(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         output = linear(x, self.weight, self.fp8)
         if self.group is not None:
-            output = autograd_all_reduce(output, group=self.group)
+            output = _ForwardAllReduce.apply(output, self.group)
         return output
 
 
