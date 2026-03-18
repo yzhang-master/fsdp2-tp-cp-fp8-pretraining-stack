@@ -16,6 +16,8 @@ from torch.distributed.checkpoint.state_dict import (
 )
 from torch.distributed.checkpoint.stateful import Stateful
 
+from .parallel import ParallelContext
+
 METADATA_FILE = "trainer.json"
 
 
@@ -37,6 +39,19 @@ class CheckpointState(Stateful):
         )
 
 
+def _checkpoint_directories(
+    directory: str | Path, parallel: ParallelContext | None
+) -> tuple[Path, Path, dist.ProcessGroup | None]:
+    root = Path(directory)
+    if parallel is None or parallel.mesh is None:
+        return root, root, None
+    return (
+        root,
+        root / f"tp_{parallel.tp_rank:02d}",
+        parallel.checkpoint_group,
+    )
+
+
 def save_checkpoint(
     directory: str | Path,
     model: nn.Module,
@@ -44,23 +59,39 @@ def save_checkpoint(
     *,
     step: int,
     data_cursor: int,
+    parallel: ParallelContext | None = None,
 ) -> None:
-    directory = Path(directory)
-    directory.mkdir(parents=True, exist_ok=True)
+    root, shard_directory, process_group = _checkpoint_directories(directory, parallel)
+    root.mkdir(parents=True, exist_ok=True)
+    shard_directory.mkdir(parents=True, exist_ok=True)
     state = {"app": CheckpointState(model, optimizer)}
-    dcp.save(state, checkpoint_id=directory, no_dist=not dist.is_initialized())
+    dcp.save(
+        state,
+        checkpoint_id=shard_directory,
+        process_group=process_group,
+        no_dist=not dist.is_initialized(),
+    )
     if not dist.is_initialized() or dist.get_rank() == 0:
         metadata = {"format_version": 1, "step": step, "data_cursor": data_cursor}
-        (directory / METADATA_FILE).write_text(json.dumps(metadata, indent=2) + "\n")
+        (root / METADATA_FILE).write_text(json.dumps(metadata, indent=2) + "\n")
     if dist.is_initialized():
         dist.barrier()
 
 
 def load_checkpoint(
-    directory: str | Path, model: nn.Module, optimizer: torch.optim.Optimizer
+    directory: str | Path,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    *,
+    parallel: ParallelContext | None = None,
 ) -> dict[str, int]:
-    directory = Path(directory)
-    metadata = json.loads((directory / METADATA_FILE).read_text())
+    root, shard_directory, process_group = _checkpoint_directories(directory, parallel)
+    metadata = json.loads((root / METADATA_FILE).read_text())
     state = {"app": CheckpointState(model, optimizer)}
-    dcp.load(state, checkpoint_id=directory, no_dist=not dist.is_initialized())
+    dcp.load(
+        state,
+        checkpoint_id=shard_directory,
+        process_group=process_group,
+        no_dist=not dist.is_initialized(),
+    )
     return {"step": int(metadata["step"]), "data_cursor": int(metadata["data_cursor"])}
