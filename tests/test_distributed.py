@@ -7,13 +7,19 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from torch.distributed.tensor import DTensor
 
 from pretraining_stack.checkpoint import load_checkpoint, save_checkpoint
 from pretraining_stack.config import ModelConfig, ParallelConfig
 from pretraining_stack.data import context_parallel_batch
 from pretraining_stack.model import LlamaForPretraining, apply_fsdp2, causal_loss
-from pretraining_stack.parallel import ParallelContext, copy_reference_parameters
-from pretraining_stack.trainer import training_step
+from pretraining_stack.parallel import (
+    ColumnParallelLinear,
+    ParallelContext,
+    RowParallelLinear,
+    copy_reference_parameters,
+)
+from pretraining_stack.trainer import synchronize_cp_gradients, training_step
 
 
 def _config() -> ModelConfig:
@@ -68,6 +74,34 @@ def _reference_loss(
     return causal_loss(model(rows[:, :-1]), labels, rows.shape[0] * (rows.shape[1] - 2))
 
 
+def _assert_gradient_parity(
+    reference: LlamaForPretraining,
+    sharded: LlamaForPretraining,
+    rows: torch.Tensor,
+    parallel: ParallelContext,
+) -> None:
+    reference.zero_grad(set_to_none=True)
+    sharded.zero_grad(set_to_none=True)
+    _reference_loss(reference, rows).backward()
+    inputs, labels, count = context_parallel_batch(
+        rows, parallel.cp_rank, parallel.config.cp_size
+    )
+    causal_loss(sharded(inputs), labels, count).backward()
+    synchronize_cp_gradients(sharded, parallel)
+    reference_parameters = dict(reference.named_parameters())
+    modules = dict(sharded.named_modules())
+    for name, parameter in sharded.named_parameters():
+        actual = parameter.grad
+        actual = actual.to_local() if isinstance(actual, DTensor) else actual
+        expected = reference_parameters[name].grad
+        module = modules[name.rsplit(".", 1)[0]]
+        if isinstance(module, ColumnParallelLinear):
+            expected = expected.chunk(module.world_size, dim=0)[module.rank]
+        elif isinstance(module, RowParallelLinear):
+            expected = expected.chunk(module.world_size, dim=1)[module.rank]
+        torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-5)
+
+
 def _tp_cp_worker(rank: int, port: int, cp_size: int) -> None:
     torch.set_num_threads(1)
     dist.init_process_group(
@@ -78,12 +112,19 @@ def _tp_cp_worker(rank: int, port: int, cp_size: int) -> None:
             ParallelConfig(dp_size=1, tp_size=3 - cp_size, cp_size=cp_size)
         )
         reference, sharded = _models(parallel)
+        reference, sharded = reference.double(), sharded.double()
         rows = torch.arange(18, dtype=torch.long).reshape(2, 9) % 64
         optimizer = torch.optim.AdamW(sharded.parameters(), lr=2e-3)
         reference_optimizer = torch.optim.AdamW(reference.parameters(), lr=2e-3)
+        inputs, _, _ = context_parallel_batch(rows, parallel.cp_rank, cp_size)
+        with torch.no_grad():
+            actual_logits = sharded(inputs)
+            expected_logits = reference(rows[:, :-1]).chunk(cp_size, dim=1)[parallel.cp_rank]
+        torch.testing.assert_close(actual_logits, expected_logits, atol=0, rtol=0)
         actual = _global_loss(sharded, rows, parallel)
         expected = _reference_loss(reference, rows, cp_size)
         torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-6)
+        _assert_gradient_parity(reference, sharded, rows, parallel)
         reference_optimizer.zero_grad(set_to_none=True)
         _reference_loss(reference, rows, cp_size).backward()
         reference_optimizer.step()
