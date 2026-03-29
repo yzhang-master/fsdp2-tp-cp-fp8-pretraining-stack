@@ -128,7 +128,9 @@ class ContextParallelAttention(nn.Module):
             x.dtype,
         )
         k_cos, k_sin = rope_tables(
-            torch.arange(local_length, device=x.device), self.head_dim, x.dtype
+            torch.arange(position_offset, position_offset + local_length, device=x.device),
+            self.head_dim,
+            x.dtype,
         )
         q, k = apply_rope(q, q_cos, q_sin), apply_rope(k, k_cos, k_sin)
         k, v = gather_sequence(k, self.cp_group), gather_sequence(v, self.cp_group)
