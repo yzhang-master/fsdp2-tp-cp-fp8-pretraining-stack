@@ -107,6 +107,10 @@ class ParallelContext:
     def cp_rank(self) -> int:
         return group_rank(self.cp_group)
 
+    @property
+    def dp_rank(self) -> int:
+        return group_rank(self.group("dp"))
+
 
 class ColumnParallelLinear(nn.Module):
     def __init__(
