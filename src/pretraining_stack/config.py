@@ -46,6 +46,21 @@ class ParallelConfig:
         return self.dp_size * self.tp_size * self.cp_size
 
 
+def logical_parameter_count(config: ModelConfig) -> int:
+    head_dim = config.hidden_size // config.num_attention_heads
+    attention = (
+        2 * config.hidden_size**2
+        + 2 * config.hidden_size * config.num_key_value_heads * head_dim
+    )
+    per_layer = attention + 3 * config.hidden_size * config.intermediate_size
+    per_layer += 2 * config.hidden_size
+    return (
+        2 * config.vocab_size * config.hidden_size
+        + config.num_hidden_layers * per_layer
+        + config.hidden_size
+    )
+
+
 TINY_CONFIG = ModelConfig(
     vocab_size=256,
     hidden_size=64,
