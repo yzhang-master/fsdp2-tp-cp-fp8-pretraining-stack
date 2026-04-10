@@ -9,7 +9,7 @@ description = "Integrated FSDP2, tensor/context parallelism, FP8 and DCP pretrai
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
-dependencies = ["torch>=2.6"]
+dependencies = ["torch>=2.6", "numpy>=1.26"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.5"]
